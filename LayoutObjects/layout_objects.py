@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Layout objects Along Axis",
     "author": "FaxLab3D",
-    "version": (1, 0),
+    "version": (1, 1),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Layout",
     "description": "Layout Selected objects end-to-end along X/Y/Z with a gap",
@@ -11,6 +11,7 @@ bl_info = {
 import bpy
 from bpy.props import EnumProperty, FloatProperty
 
+# Add sort_method to PropertyGroup
 class LayoutObjectsSettings(bpy.types.PropertyGroup):
     axis: EnumProperty(
         name="Axis",
@@ -23,11 +24,17 @@ class LayoutObjectsSettings(bpy.types.PropertyGroup):
         default=0.1,
         min=0.0
     )
+    sort_method: EnumProperty(
+        name="Sort by",
+        items=[('NAME', "Name", "Sort by Name"),
+               ('VOLUME', "Volume", "Sort by Bounding Box Volume")],
+        default='VOLUME'
+    )
 
 class OBJECT_OT_pack_on_axis(bpy.types.Operator):
     bl_idname = "object.pack_on_axis"
     bl_label = "Layout Selected"
-    bl_options = {'REGISTER','UNDO'}
+    bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
         s = context.scene.layout_objects_settings
@@ -35,29 +42,32 @@ class OBJECT_OT_pack_on_axis(bpy.types.Operator):
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
         if len(objs) < 2:
-            self.report({'WARNING'},"Select at least two objects")
+            self.report({'WARNING'}, "Select at least two objects")
             return {'CANCELLED'}
+
+        # Sort objects
+        if s.sort_method == 'NAME':
+            objs.sort(key=lambda ob: ob.name)
+        elif s.sort_method == 'VOLUME':
+            def get_volume(ob):
+                d = ob.dimensions
+                return d.x * d.y * d.z
+            objs.sort(key=get_volume, reverse=True)  # Largest first. Remove reverse=True for smallest first.
 
         ax = 'XYZ'.index(s.axis)
 
-        # Start from the first object's current center
         prev_center = objs[0].location[ax]
         prev_half = objs[0].dimensions[ax] / 2.0
-        # compute the “end” of the first object
         prev_end = prev_center + prev_half
 
         for ob in objs[1:]:
-            # half size of this object along axis
             half = ob.dimensions[ax] / 2.0
-            # new center = previous end + gap + my half
             new_center = prev_end + s.gap + half
 
-            # apply
             loc = ob.location.copy()
             loc[ax] = new_center
             ob.location = loc
 
-            # update prev_end for next
             prev_end = new_center + half
 
         return {'FINISHED'}
@@ -75,6 +85,7 @@ class VIEW3D_PT_pack_objects(bpy.types.Panel):
 
         layout.prop(s, "axis")
         layout.prop(s, "gap")
+        layout.prop(s, "sort_method")
         layout.separator()
         layout.operator("object.pack_on_axis", text="Layout Selected")
 
