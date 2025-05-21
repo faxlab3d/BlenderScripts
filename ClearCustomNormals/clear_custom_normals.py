@@ -35,7 +35,7 @@ class VIEW3D_PT_clear_split_normals(bpy.types.Panel):
     bl_idname = "VIEW3D_PT_clear_split_normals"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "Tool"
+    bl_category = "FaxLab3D"
 
     def draw(self, context):
         self.layout.operator("mesh.clear_split_normals", icon='NORMALS_VERTEX')
