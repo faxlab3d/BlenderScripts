@@ -1,178 +1,269 @@
 bl_info = {
-    "name": "UV: Align by Longest Edge (Multi-Object)",
-    "author": "FaxLab3D",
-    "version": (1, 1, 0),
-    "blender": (3, 0, 0),
-    "location": "UV Editor > N-panel > UV",
-    "description": "Rotate UV islands so their longest edge is horizontal across all selected objects",
+    "name": "Align UV Islands by Longest Edge",
+    "author": "Kajus + GPT",
+    "version": (1, 3, 0),
+    "blender": (4, 0, 0),
+    "location": "UV Editor > UV > Align by Longest Edge",
+    "description": "Rotates each UV island so its longest UV edge becomes horizontal. Handles Alt+D linked meshes once.",
     "category": "UV",
 }
 
 import bpy
 import bmesh
-from math import atan2, cos, sin
+import math
 from mathutils import Vector
 
-def uv_key(luv):
-    return (round(luv.uv.x, 10), round(luv.uv.y, 10))
 
-def gather_islands(bm, uv_layer, limit_to_selected=True):
-    sel_faces, any_sel = set(), False
-    if limit_to_selected:
-        for f in bm.faces:
-            for l in f.loops:
-                if l[uv_layer].select:
-                    any_sel = True
-                    sel_faces.add(f)
-                    break
-    if not any_sel:
-        sel_faces = set(bm.faces)
+# ---------- core uv utils ----------
+
+def _active_uv_layer(bm):
+    uv = bm.loops.layers.uv.active
+    if uv is None:
+        raise RuntimeError("No active UV layer")
+    return uv
+
+
+def _face_uv_edge_keys(face, uv_layer, tol=0.0):
+    """Return normalized UV-edge keys for all edges of a face."""
+    keys = []
+    loops = face.loops
+    n = len(loops)
+    for i in range(n):
+        uv1 = loops[i][uv_layer].uv
+        uv2 = loops[(i + 1) % n][uv_layer].uv
+        if tol > 0.0:
+            u1 = (round(uv1.x / tol) * tol, round(uv1.y / tol) * tol)
+            u2 = (round(uv2.x / tol) * tol, round(uv2.y / tol) * tol)
+            a, b = Vector(u1), Vector(u2)
+        else:
+            a, b = Vector((uv1.x, uv1.y)), Vector((uv2.x, uv2.y))
+        # order independent key
+        if (a.x, a.y) < (b.x, b.y):
+            key = (a.x, a.y, b.x, b.y)
+        else:
+            key = (b.x, b.y, a.x, a.y)
+        keys.append(key)
+    return keys
+
+
+def _build_islands(bm, respect_selection):
+    """Return list of sets of faces. Connectivity by shared identical UV edges."""
+    uv = _active_uv_layer(bm)
+    faces = [f for f in bm.faces if (f.select if respect_selection else True)]
+    if not faces:
+        return []
 
     edge_map = {}
-    for f in sel_faces:
-        for l in f.loops:
-            edge_map.setdefault(l.edge, []).append((f, l, l.link_loop_next))
+    for f in faces:
+        for key in _face_uv_edge_keys(f, uv):
+            edge_map.setdefault(key, []).append(f)
 
-    unvisited = set(sel_faces)
+    # adjacency
+    nbrs = {f: set() for f in faces}
+    for flist in edge_map.values():
+        if len(flist) > 1:
+            for i in range(len(flist)):
+                fi = flist[i]
+                for j in range(i + 1, len(flist)):
+                    fj = flist[j]
+                    nbrs[fi].add(fj)
+                    nbrs[fj].add(fi)
+
+    # BFS
     islands = []
-    while unvisited:
-        seed = unvisited.pop()
-        stack = [seed]
-        island = {seed}
+    seen = set()
+    for f in faces:
+        if f in seen:
+            continue
+        stack = [f]
+        comp = set()
+        seen.add(f)
         while stack:
-            f = stack.pop()
-            for l in f.loops:
-                f_uv_edge = {uv_key(l[uv_layer]), uv_key(l.link_loop_next[uv_layer])}
-                for of, ol1, ol2 in edge_map.get(l.edge, []):
-                    if of in unvisited:
-                        of_uv_edge = {uv_key(ol1[uv_layer]), uv_key(ol2[uv_layer])}
-                        if f_uv_edge == of_uv_edge:
-                            unvisited.remove(of)
-                            island.add(of)
-                            stack.append(of)
-        islands.append(island)
+            cur = stack.pop()
+            comp.add(cur)
+            for nb in nbrs[cur]:
+                if nb not in seen:
+                    seen.add(nb)
+                    stack.append(nb)
+        islands.append(comp)
     return islands
 
-def longest_edge_angle(island, uv_layer):
-    best_a, best_l2 = 0.0, 0.0
-    for f in island:
-        ls = f.loops
-        n = len(ls)
+
+def _island_longest_edge_uv(island_faces, uv_layer):
+    """Return (p,q) UV coords of the longest edge in the island."""
+    max_len = -1.0
+    best = (Vector((0.0, 0.0)), Vector((1.0, 0.0)))
+    seen_keys = set()
+    for f in island_faces:
+        loops = f.loops
+        n = len(loops)
         for i in range(n):
-            a = ls[i][uv_layer].uv
-            b = ls[(i+1) % n][uv_layer].uv
-            dx, dy = b.x - a.x, b.y - a.y
-            l2 = dx*dx + dy*dy
-            if l2 > best_l2 and l2 > 1e-20:
-                best_l2 = l2
-                best_a = atan2(dy, dx)
-    return best_a
+            u = Vector(loops[i][uv_layer].uv)
+            v = Vector(loops[(i + 1) % n][uv_layer].uv)
+            # de-dup with normalized key
+            key = tuple(sorted(((u.x, u.y), (v.x, v.y))))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            d = v - u
+            L = d.length
+            if L > max_len:
+                max_len = L
+                best = (u.copy(), v.copy())
+    return best
 
-def rotate_island(island, uv_layer, angle):
+
+def _island_centroid_uv(island_faces, uv_layer):
+    """Centroid of unique UV vertices in island."""
     uniq = {}
-    for f in island:
+    for f in island_faces:
         for l in f.loops:
-            k = uv_key(l[uv_layer])
-            if k not in uniq:
-                uniq[k] = l[uv_layer].uv.copy()
+            uv = l[uv_layer].uv
+            uniq[(uv.x, uv.y)] = uv
     if not uniq:
-        return
-    c = Vector((0.0, 0.0))
-    for v in uniq.values():
-        c += v
-    c /= len(uniq)
+        return Vector((0.0, 0.0))
+    s = Vector((0.0, 0.0))
+    for uv in uniq.values():
+        s.x += uv.x
+        s.y += uv.y
+    c = 1.0 / len(uniq)
+    return Vector((s.x * c, s.y * c))
 
-    ca, sa = cos(-angle), sin(-angle)
-    for f in island:
+
+def _rotate_island(island_faces, uv_layer, angle_rad, pivot):
+    ca = math.cos(angle_rad)
+    sa = math.sin(angle_rad)
+    # mutate each loop uv
+    for f in island_faces:
         for l in f.loops:
-            luv = l[uv_layer]
-            v = luv.uv - c
-            luv.uv = Vector((v.x * ca - v.y * sa, v.x * sa + v.y * ca)) + c
+            uv = l[uv_layer].uv
+            x = uv.x - pivot.x
+            y = uv.y - pivot.y
+            rx = x * ca - y * sa
+            ry = x * sa + y * ca
+            uv.x = rx + pivot.x
+            uv.y = ry + pivot.y
 
-def process_object(obj, respect_selection=True):
-    """Edits UVs for one mesh object. If object is in edit mode, use from_edit_mesh.
-       Otherwise, use a temporary BM and write back."""
+
+def _align_islands_in_bmesh(bm, respect_selection):
+    uv = _active_uv_layer(bm)
+    islands = _build_islands(bm, respect_selection)
+    total = 0
+    for isl in islands:
+        if not isl:
+            continue
+        a, b = _island_longest_edge_uv(isl, uv)
+        d = b - a
+        if d.length_squared == 0.0:
+            continue
+        ang = -math.atan2(d.y, d.x)  # rotate so edge becomes horizontal
+        pivot = _island_centroid_uv(isl, uv)
+        _rotate_island(isl, uv, ang, pivot)
+        total += 1
+    return total
+
+
+# ---------- object processing with Alt+D grouping ----------
+
+def _groups_by_mesh(objs):
+    groups = {}
+    for o in objs:
+        if o.type != 'MESH':
+            continue
+        key = o.data.as_pointer()
+        groups.setdefault(key, []).append(o)
+    return list(groups.values())
+
+
+def process_object(obj, respect_selection):
+    """Process one Mesh datablock. Uses edit-BMesh if obj in EDIT, else temp BMesh."""
     if obj.type != 'MESH':
         return 0
 
-    in_edit = obj.mode == 'EDIT'
-    if in_edit:
+    # EDIT mode: edit-bmesh is shared across all linked users of this Mesh
+    if obj.mode == 'EDIT':
         bm = bmesh.from_edit_mesh(obj.data)
-        uv_layer = bm.loops.layers.uv.active
-        if uv_layer is None:
-            return 0
-        islands = gather_islands(bm, uv_layer, limit_to_selected=respect_selection)
-        for isl in islands:
-            a = longest_edge_angle(isl, uv_layer)
-            rotate_island(isl, uv_layer, a)
-        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
-        return len(islands)
-    else:
-        bm = bmesh.new()
-        bm.from_mesh(obj.data)
-        uv_layer = bm.loops.layers.uv.active
-        if uv_layer is None:
-            bm.free()
-            return 0
-        islands = gather_islands(bm, uv_layer, limit_to_selected=False)
-        for isl in islands:
-            a = longest_edge_angle(isl, uv_layer)
-            rotate_island(isl, uv_layer, a)
-        bm.to_mesh(obj.data)
-        obj.data.update()
+        bm.faces.ensure_lookup_table()
+        count = _align_islands_in_bmesh(bm, respect_selection=True)
+        bmesh.update_edit_mesh(obj.data, loop_triangles=False)
+        return count
+
+    # OBJECT mode: operate once on the Mesh
+    me = obj.data
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(me)
+        bm.faces.ensure_lookup_table()
+        count = _align_islands_in_bmesh(bm, respect_selection=False)
+        bm.to_mesh(me)
+        me.update()
+        return count
+    finally:
         bm.free()
-        return len(islands)
+
+
+# ---------- operator ----------
 
 class UV_OT_align_by_longest_edge(bpy.types.Operator):
     bl_idname = "uv.align_by_longest_edge"
     bl_label = "Align by Longest Edge"
-    bl_description = "Rotate UV islands so their longest edge becomes horizontal for all selected mesh objects"
+    bl_description = "Rotate each UV island so its longest UV edge becomes horizontal. Processes each unique Mesh once."
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        selected_meshes = [o for o in context.selected_objects if o.type == 'MESH']
-        if not selected_meshes:
+        sel = [o for o in context.selected_objects if o.type == 'MESH']
+        if not sel:
             self.report({'ERROR'}, "Select at least one mesh object")
             return {'CANCELLED'}
 
-        # If multi-object edit mode is active, Blender only exposes one edit_object.
-        # We handle both: edit objects respect UV selection; others process all islands.
-        total = 0
-        for obj in selected_meshes:
-            total += process_object(obj, respect_selection=True)
+        total_islands = 0
+        processed_meshes = 0
 
-        self.report({'INFO'}, f"Aligned islands on {len(selected_meshes)} object(s). Total islands: {total}")
+        for group in _groups_by_mesh(sel):
+            # Prefer an edit-mode representative if present
+            rep = None
+            for o in group:
+                if o.mode == 'EDIT':
+                    rep = o
+                    break
+            if rep is None:
+                rep = group[0]
+
+            total_islands += process_object(rep, respect_selection=(rep.mode == 'EDIT'))
+            processed_meshes += 1
+
+        self.report({'INFO'}, f"Processed {processed_meshes} mesh(es). Islands aligned: {total_islands}")
         return {'FINISHED'}
 
-class UV_PT_align_longest_edge(bpy.types.Panel):
-    bl_space_type = 'IMAGE_EDITOR'
-    bl_region_type = 'UI'
-    bl_category = 'UV'
-    bl_label = 'Align by Longest Edge'
 
-    def draw(self, context):
-        self.layout.operator("uv.align_by_longest_edge", icon='UV')
+# ---------- ui ----------
+
+def _menu_func(self, _context):
+    self.layout.operator(UV_OT_align_by_longest_edge.bl_idname, icon='UV')
+
 
 classes = (
     UV_OT_align_by_longest_edge,
-    UV_PT_align_longest_edge,
 )
+
 
 def register():
     for c in classes:
         bpy.utils.register_class(c)
     try:
-        bpy.types.IMAGE_MT_uvs.append(lambda self, ctx: self.layout.operator("uv.align_by_longest_edge", icon='UV'))
+        bpy.types.IMAGE_MT_uvs.append(_menu_func)
     except Exception:
         pass
 
+
 def unregister():
     try:
-        bpy.types.IMAGE_MT_uvs.remove(lambda self, ctx: self.layout.operator("uv.align_by_longest_edge", icon='UV'))
+        bpy.types.IMAGE_MT_uvs.remove(_menu_func)
     except Exception:
         pass
     for c in reversed(classes):
         bpy.utils.unregister_class(c)
+
 
 if __name__ == "__main__":
     register()
